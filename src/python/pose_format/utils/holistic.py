@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 
@@ -259,8 +260,8 @@ def process_holistic(frames: list,
         pose_workers = os.cpu_count() or 1
 
     if pose_workers > 1 and not additional_holistic_config['static_image_mode']:
-        raise ValueError("Cannot use multiple workers with static_image_mode=False, as it is not thread-safe. "
-                         "Please set static_image_mode=True or use pose_workers=1.")
+        warnings.warn("Using multiple workers with static_image_mode=False is not thread-safe; "
+                      "results may vary slightly.", stacklevel=2)
 
     holistics = HolisticPool.acquire(pose_workers, additional_holistic_config)
 

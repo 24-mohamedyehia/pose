@@ -64,8 +64,10 @@ class TestHolisticWorkers(TestCase):
         self.assertEqual(len(self.pose_1.body.data), len(self.frames))
         self.assertEqual(len(self.pose_4.body.data), len(self.frames))
 
-    def test_multi_workers_requires_static_image_mode(self):
-        with self.assertRaises(ValueError):
+    def test_multi_workers_warns_without_static_image_mode(self):
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             load_holistic(
                 list(self.frames),
                 fps=30,
@@ -74,3 +76,4 @@ class TestHolisticWorkers(TestCase):
                 additional_holistic_config={'static_image_mode': False},
                 pose_workers=2,
             )
+            self.assertTrue(any("not thread-safe" in str(warning.message) for warning in w))
