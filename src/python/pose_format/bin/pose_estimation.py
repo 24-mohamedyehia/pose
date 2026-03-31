@@ -7,7 +7,7 @@ from simple_video_utils.frames import read_frames_exact
 from pose_format.utils.holistic import load_holistic
 
 
-def pose_video(input_path: str, output_path: str, format: str, additional_config: dict = {'model_complexity': 1}, progress: bool = True):
+def pose_video(input_path: str, output_path: str, format: str, additional_config: dict = {'model_complexity': 1}, progress: bool = True, pose_workers: int = 1):
     # Load video metadata
     print('Loading video ...')
     metadata = video_metadata(input_path)
@@ -24,7 +24,8 @@ def pose_video(input_path: str, output_path: str, format: str, additional_config
                              width=width,
                              height=height,
                              progress=progress,
-                             additional_holistic_config=additional_config)
+                             additional_holistic_config=additional_config,
+                             pose_workers=pose_workers)
     else:
         raise NotImplementedError('Pose format not supported')
 
@@ -67,6 +68,7 @@ def main():
                         type=str,
                         help='type of pose estimation to use')
     parser.add_argument('--additional-config', type=str, help='additional configuration for the pose estimator')
+    parser.add_argument('--workers', type=int, default=1, help='number of parallel holistic instances (0 = all CPUs)')
 
     args = parser.parse_args()
 
@@ -74,7 +76,7 @@ def main():
         raise FileNotFoundError(f"Video file {args.i} not found")
 
     additional_config = parse_additional_config(args.additional_config)
-    pose_video(args.i, args.o, args.format, additional_config)
+    pose_video(args.i, args.o, args.format, additional_config, pose_workers=args.workers)
 
     # pip install . && video_to_pose -i como.mp4 -o como1.pose --format mediapipe
     # pip install . && video_to_pose -i como.mp4 -o como2.pose --format mediapipe --additional-config="model_complexity=2,smooth_landmarks=false,refine_face_landmarks=true"

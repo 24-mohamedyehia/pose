@@ -1,3 +1,9 @@
+import json
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List
+
 import numpy as np
 from tqdm import tqdm
 
@@ -93,6 +99,39 @@ FLIPPED_BODY_POINTS = [
 ]
 
 
+class HolisticPool:
+    _lock = threading.Lock()
+    _instances: Dict[str, List] = {}
+
+    @staticmethod
+    def _config_key(config: dict) -> str:
+        return json.dumps(config, sort_keys=True)
+
+    @classmethod
+    def acquire(cls, n: int, config: dict) -> list:
+        key = cls._config_key(config)
+        acquired = []
+        with cls._lock:
+            pool = cls._instances.setdefault(key, [])
+            while pool and len(acquired) < n:
+                acquired.append(pool.pop())
+
+        need = n - len(acquired)
+        if need > 0:
+            new = [mp_holistic.Holistic(**config) for _ in range(need)]
+            acquired.extend(new)
+
+        return acquired
+
+    @classmethod
+    def release(cls, instances: list, config: dict):
+        key = cls._config_key(config)
+        for h in instances:
+            h.reset()
+        with cls._lock:
+            cls._instances.setdefault(key, []).extend(instances)
+
+
 def component_points(component, width: int, height: int, num: int):
     """
     Gets component points
@@ -147,6 +186,31 @@ def body_points(component, width: int, height: int, num: int):
     return np.zeros((num, 3)), np.zeros(num)
 
 
+def _extract_frame_data(results, w, h, additional_face_points, kinect=None, frame_idx=0):
+    body_data, body_confidence = body_points(results.pose_landmarks, w, h, 33)
+    face_data, face_confidence = component_points(results.face_landmarks, w, h,
+                                                  FACE_POINTS_NUM(additional_face_points))
+    lh_data, lh_confidence = component_points(results.left_hand_landmarks, w, h, 21)
+    rh_data, rh_confidence = component_points(results.right_hand_landmarks, w, h, 21)
+    body_world_data, body_world_confidence = body_points(results.pose_world_landmarks, w, h, 33)
+
+    data = np.concatenate([body_data, face_data, lh_data, rh_data, body_world_data])
+    conf = np.concatenate([body_confidence, face_confidence, lh_confidence, rh_confidence, body_world_confidence])
+
+    if kinect is not None:
+        kinect_depth = []
+        for x, y, z in np.array(data, dtype="int32"):
+            if 0 < x < w and 0 < y < h:
+                kinect_depth.append(kinect[frame_idx, y, x, 0])
+            else:
+                kinect_depth.append(0)
+
+        kinect_vec = np.expand_dims(np.array(kinect_depth), axis=-1)
+        data = np.concatenate([data, kinect_vec], axis=-1)
+
+    return data, conf
+
+
 def process_holistic(frames: list,
                      fps: float,
                      w: int,
@@ -154,7 +218,9 @@ def process_holistic(frames: list,
                      kinect=None,
                      progress=False,
                      additional_face_points=0,
-                     additional_holistic_config={}) -> NumPyPoseBody:
+                     additional_holistic_config={},
+                     pose_workers=1,
+                     reuse=True) -> NumPyPoseBody:
     """
     process frames using holistic model from mediapipe
 
@@ -176,6 +242,10 @@ def process_holistic(frames: list,
         Additional face landmarks (points)
     additional_holistic_config : dict, optional
         Additional configurations for holistic model
+    pose_workers : int, optional
+        Number of parallel holistic instances for interleaved processing.
+    reuse : bool, optional
+        If True, holistic instances are pooled and reused across calls.
 
     Returns
     -------
@@ -184,45 +254,62 @@ def process_holistic(frames: list,
     """
     if 'static_image_mode' not in additional_holistic_config:
         additional_holistic_config['static_image_mode'] = False
-    holistic = mp_holistic.Holistic(**additional_holistic_config)
+
+    if pose_workers <= 0:
+        pose_workers = os.cpu_count() or 1
+
+    if pose_workers > 1 and not additional_holistic_config['static_image_mode']:
+        raise ValueError("Cannot use multiple workers with static_image_mode=False, as it is not thread-safe. "
+                         "Please set static_image_mode=True or use pose_workers=1.")
+
+    holistics = HolisticPool.acquire(pose_workers, additional_holistic_config)
 
     try:
         datas = []
         confs = []
 
-        for i, frame in enumerate(tqdm(frames, disable=not progress)):
-            results = holistic.process(frame)
+        def process_on_worker(worker_idx, frame):
+            return holistics[worker_idx].process(frame)
 
-            body_data, body_confidence = body_points(results.pose_landmarks, w, h, 33)
-            face_data, face_confidence = component_points(results.face_landmarks, w, h,
-                                                          FACE_POINTS_NUM(additional_face_points))
-            lh_data, lh_confidence = component_points(results.left_hand_landmarks, w, h, 21)
-            rh_data, rh_confidence = component_points(results.right_hand_landmarks, w, h, 21)
-            body_world_data, body_world_confidence = body_points(results.pose_world_landmarks, w, h, 33)
+        with ThreadPoolExecutor(max_workers=pose_workers) as executor:
+            pending = {}
+            worker_futures = {}
+            next_to_collect = 0
 
-            data = np.concatenate([body_data, face_data, lh_data, rh_data, body_world_data])
-            conf = np.concatenate([body_confidence, face_confidence, lh_confidence, rh_confidence, body_world_confidence])
+            for i, frame in enumerate(tqdm(frames, disable=not progress)):
+                worker_idx = i % pose_workers
+                if worker_idx in worker_futures:
+                    worker_futures[worker_idx].result()
+                future = executor.submit(process_on_worker, worker_idx, frame)
+                pending[i] = future
+                worker_futures[worker_idx] = future
 
-            if kinect is not None:
-                kinect_depth = []
-                for x, y, z in np.array(data, dtype="int32"):
-                    if 0 < x < w and 0 < y < h:
-                        kinect_depth.append(kinect[i, y, x, 0])
-                    else:
-                        kinect_depth.append(0)
+                while next_to_collect in pending and pending[next_to_collect].done():
+                    results = pending.pop(next_to_collect).result()
+                    data, conf = _extract_frame_data(results, w, h, additional_face_points, kinect, next_to_collect)
+                    datas.append(data)
+                    confs.append(conf)
+                    next_to_collect += 1
 
-                kinect_vec = np.expand_dims(np.array(kinect_depth), axis=-1)
-                data = np.concatenate([data, kinect_vec], axis=-1)
+            while next_to_collect in pending:
+                results = pending.pop(next_to_collect).result()
+                data, conf = _extract_frame_data(results, w, h, additional_face_points, kinect, next_to_collect)
+                datas.append(data)
+                confs.append(conf)
+                next_to_collect += 1
 
-            datas.append(data)
-            confs.append(conf)
+        if not datas:
+            raise ValueError("need at least one array to stack")
 
         pose_body_data = np.expand_dims(np.stack(datas), axis=1)
         pose_body_conf = np.expand_dims(np.stack(confs), axis=1)
-
         return NumPyPoseBody(data=pose_body_data, confidence=pose_body_conf, fps=fps)
     finally:
-        holistic.close()
+        if reuse:
+            HolisticPool.release(holistics, additional_holistic_config)
+        else:
+            for h in holistics:
+                h.close()
 
 
 def holistic_hand_component(name, pf="XYZC") -> PoseHeaderComponent:
@@ -292,7 +379,9 @@ def load_holistic(frames: list,
                   depth=0,
                   kinect=None,
                   progress=False,
-                  additional_holistic_config={}) -> Pose:
+                  additional_holistic_config={},
+                  pose_workers=1,
+                  reuse=True) -> Pose:
     """
     Loads holistic pose data
 
@@ -318,7 +407,7 @@ def load_holistic(frames: list,
     Returns
     -------
     Pose
-        Loaded pose data with header and body 
+        Loaded pose data with header and body
     """
     pf = "XYZC" if kinect is None else "XYZKC"
 
@@ -331,7 +420,7 @@ def load_holistic(frames: list,
                                     dimensions=dimensions,
                                     components=holistic_components(pf, additional_face_points))
     body: NumPyPoseBody = process_holistic(frames, fps, width, height, kinect, progress, additional_face_points,
-                                           additional_holistic_config)
+                                           additional_holistic_config, pose_workers=pose_workers, reuse=reuse)
 
     return Pose(header, body)
 
@@ -415,7 +504,7 @@ def load_mediapipe_directory(directory: str, fps: float, width: int, height: int
     -------
     tuple of numpy.ndarray
         A tuple containing two arrays:
-        The first array is the landmarks data including x, y, z coordinates. 
+        The first array is the landmarks data including x, y, z coordinates.
         The second array is the confidence scores for each landmark.
          """
 
@@ -437,7 +526,7 @@ def load_mediapipe_directory(directory: str, fps: float, width: int, height: int
     def load_mediapipe_frames() -> NumPyPoseBody:
         """
         From a list of frames, load  pose data and confidance into a NumPyPoseBody
-        
+
         Processes each frame from `frames` to extract the data and confidence values
         for pose landmarks, face landmarks, and left & right hand landmarks.
 
