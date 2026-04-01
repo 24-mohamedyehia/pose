@@ -123,13 +123,12 @@ class HolisticPool:
 
         need = n - len(acquired)
 
-        # Clear tracking state for reused instances by processing a blank frame.
-        # This flushes the PreviousLoopbackCalculator state so the next real frame
-        # runs full detection instead of using stale tracking from a previous video.
-        reused = acquired[:len(acquired) - need]
-        if reused and not config.get('static_image_mode', False):
-            with ThreadPoolExecutor(max_workers=len(reused)) as ex:
-                list(ex.map(lambda h: h.process(cls._BLANK_FRAME), reused))
+        # Clear internal graph state for reused instances by processing a blank frame.
+        # Faster than reset() (which tears down and restarts the entire graph)
+        # while flushing stale tracking/detection state from a previous video.
+        if acquired:
+            with ThreadPoolExecutor(max_workers=len(acquired)) as ex:
+                list(ex.map(lambda h: h.process(cls._BLANK_FRAME), acquired))
 
         if need > 0:
             with ThreadPoolExecutor(max_workers=need) as ex:
