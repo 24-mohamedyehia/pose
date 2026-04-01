@@ -103,6 +103,10 @@ FLIPPED_BODY_POINTS = [
 class HolisticPool:
     _lock = threading.Lock()
     _instances: Dict[str, List] = {}
+    # A small blank frame used to clear tracking state between videos.
+    # Faster than reset() (which tears down and restarts the entire MediaPipe graph)
+    # while producing identical results to static_image_mode=True on the next frame.
+    _BLANK_FRAME = np.ones((256, 256, 3), dtype=np.uint8) * 255
 
     @staticmethod
     def _config_key(config: dict) -> str:
@@ -117,9 +121,18 @@ class HolisticPool:
             while pool and len(acquired) < n:
                 acquired.append(pool.pop())
 
+        # Clear tracking state for reused instances by processing a blank frame.
+        # This flushes the PreviousLoopbackCalculator state so the next real frame
+        # runs full detection instead of using stale tracking from a previous video.
+        reused = acquired[:len(acquired) - need]
+        if reused and not config.get('static_image_mode', False):
+            with ThreadPoolExecutor(max_workers=len(reused)) as ex:
+                list(ex.map(lambda h: h.process(cls._BLANK_FRAME), reused))
+
         need = n - len(acquired)
         if need > 0:
-            new = [mp_holistic.Holistic(**config) for _ in range(need)]
+            with ThreadPoolExecutor(max_workers=need) as ex:
+                new = list(ex.map(lambda _: mp_holistic.Holistic(**config), range(need)))
             acquired.extend(new)
 
         return acquired
@@ -127,8 +140,6 @@ class HolisticPool:
     @classmethod
     def release(cls, instances: list, config: dict):
         key = cls._config_key(config)
-        for h in instances:
-            h.reset()
         with cls._lock:
             cls._instances.setdefault(key, []).extend(instances)
 
