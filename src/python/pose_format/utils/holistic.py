@@ -121,6 +121,8 @@ class HolisticPool:
             while pool and len(acquired) < n:
                 acquired.append(pool.pop())
 
+        need = n - len(acquired)
+
         # Clear tracking state for reused instances by processing a blank frame.
         # This flushes the PreviousLoopbackCalculator state so the next real frame
         # runs full detection instead of using stale tracking from a previous video.
@@ -129,7 +131,6 @@ class HolisticPool:
             with ThreadPoolExecutor(max_workers=len(reused)) as ex:
                 list(ex.map(lambda h: h.process(cls._BLANK_FRAME), reused))
 
-        need = n - len(acquired)
         if need > 0:
             with ThreadPoolExecutor(max_workers=need) as ex:
                 new = list(ex.map(lambda _: mp_holistic.Holistic(**config), range(need)))
